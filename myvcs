@@ -1,0 +1,1672 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import hashlib
+import zlib
+import json
+import configparser
+import stat
+import time
+import datetime
+import pytz
+import difflib
+
+class Blob:
+    def __init__(self, repo, data):
+        self.repo = repo
+        self.data = data
+
+class Tree:
+    def __init__(self, repo, data):
+        self.repo = repo
+        self.data = data
+        self.entries = self.deserialize(data)
+
+    def deserialize(self, data):
+        entries = []
+        # Basic parsing of tree data (mode, type, sha, name)
+        # This is a simplified implementation; a real VCS would handle permissions and modes properly
+        for line in data.decode().splitlines():
+            parts = line.split() # Split by whitespace
+            if len(parts) >= 3:
+                mode = parts[0]
+                type = parts[1]
+                sha = parts[2]
+                name = " ".join(parts[3:]) # Handle filenames with spaces
+                entries.append({
+                    "mode": mode,
+                    "type": type,
+                    "sha": sha,
+                    "name": name
+                })
+        return entries
+
+class Commit:
+    def __init__(self, repo, data):
+        self.repo = repo
+        self.data = data
+        self.kvlm = self.deserialize(data)
+
+    def deserialize(self, data):
+        # Deserialize key-value list with message format
+        kvlm = {}
+        lines = data.decode().splitlines()
+        i = 0
+        while i < len(lines) and lines[i].strip() != "": 
+            line = lines[i]
+            if ' ' in line:
+                key, value = line.split(' ', 1)
+                if key in kvlm:
+                    if not isinstance(kvlm[key], list):
+                        kvlm[key] = [kvlm[key]]
+                    kvlm[key].append(value)
+                else:
+                    kvlm[key] = value
+            i += 1
+        kvlm["message"] = "\n".join(lines[i+1:])
+        return kvlm
+
+    def get_parent(self):
+        parent = self.kvlm.get("parent")
+        if parent:
+            if isinstance(parent, list):
+                return parent[0] # Return the first parent for simplicity
+            return parent
+        return None
+    
+    def get_parents(self):
+        """Returns list of parent commit SHAs"""
+        parent = self.kvlm.get("parent")
+        if parent is None:
+            return []
+        if isinstance(parent, list):
+            return parent
+        return [parent]
+
+
+
+def repo_find(path="."):
+    """Finds the repository root above path."""
+    path = os.path.realpath(path)
+
+    if os.path.isdir(os.path.join(path, ".myvcs")):
+        return GitRepository(path)
+
+    parent = os.path.realpath(os.path.join(path, ".."))
+
+    if parent == path:
+        # Base case
+        return None
+
+    # Recursive case
+    return repo_find(parent)
+
+
+
+
+# def checkout_tree(repo, tree_sha, path="."):
+#     """Restore files from a tree object to the working directory."""
+#     tree = read_object(repo, tree_sha)
+#     if not isinstance(tree, Tree):
+#         raise Exception(f"Object {tree_sha} is not a tree.")
+
+#     # Clear the current directory (excluding .myvcs)
+#     if os.path.exists(path):
+#         for item in os.listdir(path):
+#             item_path = os.path.join(path, item)
+#             if item != ".myvcs":
+#                 if os.path.isdir(item_path):
+#                     # For simplicity, we won't recursively remove directories initially
+#                     print(f"Skipping directory removal: {item_path}")
+#                 else:
+#                     os.remove(item_path)
+
+#     # Write files from the tree object
+#     for entry in tree.entries:
+#         entry_path = os.path.join(path, entry["name"])
+#         if entry["type"] == "blob":
+#             blob = read_object(repo, entry["sha"])
+#             if isinstance(blob, Blob):
+#                 # Ensure parent directories exist
+#                 os.makedirs(os.path.dirname(entry_path), exist_ok=True)
+#                 with open(entry_path, "wb") as f:
+#                     f.write(blob.data)
+#             else:
+#                  print(f"Warning: Object {entry['sha']} is not a blob.")
+#         elif entry["type"] == "tree":
+#             checkout_tree(repo, entry["sha"], path=entry_path)
+
+# def checkout_tree(repo, tree_sha, path="."):
+#     """Restore files from a tree object to the working directory."""
+#     tree = read_object(repo, tree_sha)
+#     if not isinstance(tree, Tree):
+#         raise Exception(f"Object {tree_sha} is not a tree.")
+
+#     # Clear the current directory (excluding .myvcs)
+#     if os.path.exists(path):
+#         for item in os.listdir(path):
+#             item_path = os.path.join(path, item)
+#             if item != ".myvcs":
+#                 if os.path.isdir(item_path):
+#                     # For simplicity, we won't recursively remove directories initially
+#                     print(f"Skipping directory removal: {item_path}")
+#                 else:
+#                     os.remove(item_path)
+
+#     # Write files from the tree object
+#     for entry in tree.entries:
+#         entry_path = os.path.join(path, entry["name"])
+#         if entry["type"] == "blob":
+#             blob = read_object(repo, entry["sha"])
+#             if isinstance(blob, Blob):
+#                 # Ensure parent directories exist - fix for the error
+#                 parent_dir = os.path.dirname(entry_path)
+#                 if parent_dir and parent_dir != path:  # Only create if parent_dir is not empty and not the same as path
+#                     os.makedirs(parent_dir, exist_ok=True)
+                
+#                 with open(entry_path, "wb") as f:
+#                     f.write(blob.data)
+#             else:
+#                  print(f"Warning: Object {entry['sha']} is not a blob.")
+#         elif entry["type"] == "tree":
+#             # Ensure the directory exists before recursing
+#             os.makedirs(entry_path, exist_ok=True)
+#             checkout_tree(repo, entry["sha"], path=entry_path)
+
+# def cmd_checkout(args):
+#     """Restore files from a commit or switch branches."""
+#     repo = repo_find()
+#     if repo is None:
+#         raise Exception("Not a myvcs repository.")
+
+#     target = args.target
+
+#     # Determine if the target is a commit SHA or a branch name
+#     commit_sha = None
+#     branch_ref = None
+
+#     # Check if it's a branch name
+#     branch_path = ref_path(repo, f"heads/{target}")
+#     if os.path.exists(branch_path):
+#         branch_ref = f"refs/heads/{target}"
+#         with open(branch_path, "r") as f:
+#             commit_sha = f.read().strip()
+#     else:
+#         # Assume it's a commit SHA
+#         commit_sha = target
+
+#     # Check if the commit exists and is a commit object
+#     commit = read_object(repo, commit_sha)
+#     if not isinstance(commit, Commit):
+#         raise Exception(f"Object {commit_sha} is not a commit or branch not found.")
+
+#     # Get the top-level tree SHA from the commit
+#     tree_sha = commit.kvlm["tree"]
+
+#     # Restore files from the tree
+#     checkout_tree(repo, tree_sha, path=repo.worktree)
+
+#     # Update HEAD
+#     head_path = repo_file(repo, "HEAD", mkdir=True)
+#     with open(head_path, "w") as f:
+#         if branch_ref:
+#             # HEAD points to a branch
+#             f.write(f"ref: {branch_ref}\n")
+#         else:
+#              # HEAD points directly to a commit (detached HEAD)
+#              f.write(commit_sha)
+
+#     if branch_ref:
+#         print(f"Switched to branch {target}")
+#     else:
+#         print(f"Checked out commit {commit_sha[:7]}")
+
+# def checkout_tree(repo, tree_sha, path="."):
+#     """Restore files from a tree object to the working directory."""
+#     print(f"DEBUG: checkout_tree called with tree_sha={tree_sha}, path={path}")
+    
+#     tree = read_object(repo, tree_sha)
+#     if not isinstance(tree, Tree):
+#         raise Exception(f"Object {tree_sha} is not a tree.")
+
+#     print(f"DEBUG: Tree has {len(tree.entries)} entries")
+    
+#     # Clear the current directory (excluding .myvcs)
+#     if os.path.exists(path):
+#         for item in os.listdir(path):
+#             item_path = os.path.join(path, item)
+#             if item != ".myvcs":
+#                 if os.path.isdir(item_path):
+#                     # For simplicity, we won't recursively remove directories initially
+#                     print(f"Skipping directory removal: {item_path}")
+#                 else:
+#                     os.remove(item_path)
+
+#     # Write files from the tree object
+#     for entry in tree.entries:
+#         print(f"DEBUG: Processing entry: {entry}")
+        
+#         entry_name = entry.get("name")
+#         entry_type = entry.get("type")
+#         entry_sha = entry.get("sha")
+        
+#         print(f"DEBUG: entry_name={entry_name}, entry_type={entry_type}, entry_sha={entry_sha}")
+        
+#         if entry_name is None:
+#             print(f"ERROR: entry name is None for entry: {entry}")
+#             continue
+            
+#         entry_path = os.path.join(path, entry_name)
+#         print(f"DEBUG: entry_path={entry_path}")
+        
+#         if entry_type == "blob":
+#             blob = read_object(repo, entry_sha)
+#             if isinstance(blob, Blob):
+#                 # Ensure parent directories exist
+#                 parent_dir = os.path.dirname(entry_path)
+#                 print(f"DEBUG: parent_dir={parent_dir}")
+                
+#                 if parent_dir and parent_dir != path and parent_dir != ".":
+#                     print(f"DEBUG: Creating parent directory: {parent_dir}")
+#                     os.makedirs(parent_dir, exist_ok=True)
+                
+#                 print(f"DEBUG: Writing file: {entry_path}")
+#                 with open(entry_path, "wb") as f:
+#                     f.write(blob.data)
+#             else:
+#                  print(f"Warning: Object {entry_sha} is not a blob.")
+#         elif entry_type == "tree":
+#             print(f"DEBUG: Creating directory and recursing: {entry_path}")
+#             os.makedirs(entry_path, exist_ok=True)
+#             checkout_tree(repo, entry_sha, path=entry_path)
+
+# def cmd_checkout(args):
+#     """Restore files from a commit or switch branches."""
+#     print(f"DEBUG: cmd_checkout called with target={args.target}")
+    
+#     repo = repo_find()
+#     if repo is None:
+#         raise Exception("Not a myvcs repository.")
+    
+#     print(f"DEBUG: Found repo at {repo.worktree}")
+
+#     target = args.target
+
+#     # Determine if the target is a commit SHA or a branch name
+#     commit_sha = None
+#     branch_ref = None
+
+#     # Check if it's a branch name
+#     branch_path = ref_path(repo, f"heads/{target}")
+#     print(f"DEBUG: Checking branch path: {branch_path}")
+    
+#     if os.path.exists(branch_path):
+#         branch_ref = f"refs/heads/{target}"
+#         with open(branch_path, "r") as f:
+#             commit_sha = f.read().strip()
+#         print(f"DEBUG: Found branch {target} -> {commit_sha}")
+#     else:
+#         # Check if it's a tag name
+#         tag_path = ref_path(repo, f"tags/{target}")
+#         print(f"DEBUG: Checking tag path: {tag_path}")
+        
+#         if os.path.exists(tag_path):
+#             with open(tag_path, "r") as f:
+#                 commit_sha = f.read().strip()
+#             print(f"DEBUG: Found tag {target} -> {commit_sha}")
+#         else:
+#             # Assume it's a commit SHA
+#             if len(target) < 7:
+#                 raise Exception("Commit SHA must be at least 7 characters")
+#             # Try to find the full SHA from the partial
+#             obj_dir = os.path.join(repo.myvcsdir, "objects", target[:2])
+#             print(f"DEBUG: Looking for commit in {obj_dir}")
+            
+#             if os.path.exists(obj_dir):
+#                 for obj_file in os.listdir(obj_dir):
+#                     if obj_file.startswith(target[2:]):
+#                         commit_sha = target[:2] + obj_file
+#                         print(f"DEBUG: Found full SHA: {commit_sha}")
+#                         break
+#             if not commit_sha:
+#                 raise Exception(f"Invalid target: {target} - not a branch, tag, or commit SHA")
+
+#     print(f"DEBUG: Final commit_sha: {commit_sha}")
+
+#     # Verify the commit exists
+#     try:
+#         commit = read_object(repo, commit_sha)
+#         if not isinstance(commit, Commit):
+#             raise Exception(f"Object {commit_sha} is not a commit")
+#     except Exception as e:
+#         raise Exception(f"Error reading commit {commit_sha}: {e}")
+
+#     print(f"DEBUG: Successfully read commit")
+
+#     # Get the top-level tree SHA from the commit
+#     tree_sha = commit.kvlm.get("tree")
+#     print(f"DEBUG: Tree SHA from commit: {tree_sha}")
+    
+#     if tree_sha is None:
+#         raise Exception(f"Commit {commit_sha} has no tree")
+
+#     # Restore files from the tree
+#     print(f"DEBUG: About to checkout tree {tree_sha} to {repo.worktree}")
+#     checkout_tree(repo, tree_sha, path=repo.worktree)
+
+#     # Update HEAD
+#     head_path = repo_file(repo, "HEAD", mkdir=True)
+#     print(f"DEBUG: Updating HEAD at {head_path}")
+    
+#     with open(head_path, "w") as f:
+#         if branch_ref:
+#             # HEAD points to a branch
+#             f.write(f"ref: {branch_ref}\n")
+#         else:
+#             # HEAD points directly to a commit (detached HEAD)
+#             f.write(commit_sha)
+
+#     if branch_ref:
+#         print(f"Switched to branch '{target}'")
+#     else:
+#         print(f"Note: switching to '{commit_sha[:7]}'")
+#         print("\nYou are in 'detached HEAD' state. You can look around, make experimental")
+#         print("changes and commit them, and you can discard any commits you make in this")
+#         print("state without impacting any branches by switching back to a branch.")
+        
+   
+   
+def cmd_checkout(args):
+    """Restore files from a commit or switch branches."""
+    repo = repo_find()
+    if repo is None:
+        raise Exception("Not a myvcs repository.")
+
+    target = args.target
+
+    # Determine if the target is a commit SHA or a branch name
+    commit_sha = None
+    branch_ref = None
+
+    # Check if it's a branch name
+    branch_path = ref_path(repo, f"heads/{target}")
+    if branch_path and os.path.exists(branch_path):
+        branch_ref = f"refs/heads/{target}"
+        with open(branch_path, "r") as f:
+            commit_sha = f.read().strip()
+    else:
+        # Check if it's a tag name
+        tag_path = ref_path(repo, f"tags/{target}")
+        if tag_path and os.path.exists(tag_path):
+            with open(tag_path, "r") as f:
+                commit_sha = f.read().strip()
+        else:
+            # Assume it's a commit SHA
+            if len(target) < 7:
+                raise Exception("Commit SHA must be at least 7 characters")
+            # Try to find the full SHA from the partial
+            obj_dir = os.path.join(repo.myvcsdir, "objects", target[:2])
+            if os.path.exists(obj_dir):
+                for obj_file in os.listdir(obj_dir):
+                    if obj_file.startswith(target[2:]):
+                        commit_sha = target[:2] + obj_file
+                        break
+            if not commit_sha:
+                raise Exception(f"Invalid target: {target} - not a branch, tag, or commit SHA")
+
+    # Verify the commit exists
+    try:
+        commit = read_object(repo, commit_sha)
+        if not isinstance(commit, Commit):
+            raise Exception(f"Object {commit_sha} is not a commit")
+    except Exception as e:
+        raise Exception(f"Error reading commit {commit_sha}: {e}")
+
+    # Get the top-level tree SHA from the commit
+    tree_sha = commit.kvlm.get("tree")
+    if tree_sha is None:
+        raise Exception(f"Commit {commit_sha} has no tree")
+
+    # Restore files from the tree
+    checkout_tree(repo, tree_sha, path=repo.worktree)
+
+    # Update HEAD
+    head_path = repo_file(repo, "HEAD", mkdir=True)
+    with open(head_path, "w") as f:
+        if branch_ref:
+            # HEAD points to a branch
+            f.write(f"ref: {branch_ref}\n")
+        else:
+            # HEAD points directly to a commit (detached HEAD)
+            f.write(commit_sha)
+
+    if branch_ref:
+        print(f"Switched to branch '{target}'")
+    else:
+        print(f"Note: switching to '{commit_sha[:7]}'")
+        print("\nYou are in 'detached HEAD' state. You can look around, make experimental")
+        print("changes and commit them, and you can discard any commits you make in this")
+        print("state without impacting any branches by switching back to a branch.")
+
+def checkout_tree(repo, tree_sha, path="."):
+    """Restore files from a tree object to the working directory."""
+    tree = read_object(repo, tree_sha)
+    if not isinstance(tree, Tree):
+        raise Exception(f"Object {tree_sha} is not a tree.")
+
+    # Clear the current directory (excluding .myvcs)
+    if os.path.exists(path):
+        for item in os.listdir(path):
+            item_path = os.path.join(path, item)
+            if item != ".myvcs":
+                if os.path.isdir(item_path):
+                    # For simplicity, we won't recursively remove directories initially
+                    print(f"Skipping directory removal: {item_path}")
+                else:
+                    os.remove(item_path)
+
+    # Write files from the tree object
+    for entry in tree.entries:
+        entry_name = entry.get("name")
+        entry_type = entry.get("type")
+        entry_sha = entry.get("sha")
+        
+        if not entry_name:
+            print(f"Warning: Skipping entry with no name: {entry}")
+            continue
+            
+        entry_path = os.path.join(path, entry_name)
+        
+        if entry_type == "blob":
+            blob = read_object(repo, entry_sha)
+            if isinstance(blob, Blob):
+                # Ensure parent directories exist
+                parent_dir = os.path.dirname(entry_path)
+                if parent_dir and parent_dir != path and parent_dir != ".":
+                    os.makedirs(parent_dir, exist_ok=True)
+                
+                with open(entry_path, "wb") as f:
+                    f.write(blob.data)
+            else:
+                print(f"Warning: Object {entry_sha} is not a blob.")
+        elif entry_type == "tree":
+            os.makedirs(entry_path, exist_ok=True)
+            checkout_tree(repo, entry_sha, path=entry_path)   
+        
+def find_commit_by_partial_sha(repo, partial_sha):
+    """Find a full commit SHA from a partial SHA."""
+    if len(partial_sha) < 7:
+        raise Exception("Partial SHA must be at least 7 characters")
+    
+    obj_dir = os.path.join(repo.myvcsdir, "objects")
+    for root, dirs, files in os.walk(obj_dir):
+        for file in files:
+            full_sha = os.path.basename(root) + file
+            if full_sha.startswith(partial_sha):
+                # Verify it's a commit object
+                obj_type, _ = cat_file(repo, full_sha)
+                if obj_type == "commit":
+                    return full_sha
+    return None
+
+def ref_path(repo, ref, mkdir=False):
+    """Compute path under repo's .myvcs/refs/ dir."""
+    return repo_file(repo, "refs", *ref.split("/"), mkdir=mkdir)
+
+def read_ref(repo, ref):
+    """Read the SHA-1 hash from a reference file."""
+    ref_file = ref_path(repo, ref)
+    if not os.path.exists(ref_file):
+        return None
+    with open(ref_file, "r") as f:
+        return f.read().strip()
+
+def write_ref(repo, ref, sha):
+    """Write a SHA-1 hash to a reference file."""
+    ref_file = ref_path(repo, ref, mkdir=True)
+    with open(ref_file, "w") as f:
+        f.write(sha)
+        
+        
+        
+def cmd_branch(args):
+    """Create a new branch reference."""
+    repo = repo_find()
+    if repo is None:
+        raise Exception("Not a myvcs repository.")
+
+    branch_name = args.name
+    start_commit_sha = args.start_point
+
+    if start_commit_sha is None:
+        # If no start point is specified, use the current HEAD commit
+        head_path = repo_file(repo, "HEAD")
+        if not os.path.exists(head_path):
+            raise Exception("Repository has no commits yet.")
+
+        with open(head_path, "r") as f:
+            head_content = f.read().strip()
+            if head_content.startswith("ref: "):
+                # HEAD points to a branch, read the commit hash from the branch file
+                branch_ref = head_content[5:]
+                branch_path = repo_file(repo, branch_ref)
+                if not os.path.exists(branch_path):
+                     raise Exception(f"Branch {branch_ref} not found.")
+                with open(branch_path, "r") as bf:
+                    start_commit_sha = bf.read().strip()
+            else:
+                # HEAD points directly to a commit (detached HEAD)
+                start_commit_sha = head_content
+
+    # Check if the start commit exists and is a commit object
+    commit = read_object(repo, start_commit_sha)
+    if not isinstance(commit, Commit):
+        raise Exception(f"Object {start_commit_sha} is not a commit.")
+
+    # Write the new branch reference
+    write_ref(repo, f"heads/{branch_name}", start_commit_sha)
+
+    print(f"Created branch {branch_name}")
+    
+    
+def cmd_tag(args):
+    """Create a new tag reference."""
+    repo = repo_find()
+    if repo is None:
+        raise Exception("Not a myvcs repository.")
+
+    tag_name = args.name
+    commit_sha = args.commit
+
+    # Check if the commit exists and is a commit object
+    commit = read_object(repo, commit_sha)
+    if not isinstance(commit, Commit):
+        raise Exception(f"Object {commit_sha} is not a commit.")
+
+    # Write the new tag reference
+    write_ref(repo, f"tags/{tag_name}", commit_sha)
+
+    print(f"Created tag {tag_name} at {commit_sha[:7]}")
+
+# Helper function to get the path to a file within the .myvcs directory
+def repo_path(repo, *path):
+    """Compute path under repo's .myvcs dir."""
+    return os.path.join(repo.myvcsdir, *path)
+
+def commit_tree(repo, tree_sha, parent_sha, author, committer, message):
+    """Create a commit object and return its hash."""
+    # Format commit data
+    commit_content = f"tree {tree_sha}\n".encode()
+
+    if parent_sha:
+        commit_content += f"parent {parent_sha}\n".encode()
+
+    # Get current time in UTC
+    utc_now = datetime.datetime.now(pytz.utc)
+    timestamp = int(utc_now.timestamp())
+    offset = utc_now.utcoffset().total_seconds() / 60 # Offset in minutes
+    offset_str = f"{int(offset // 60):+03d}{int(offset % 60):02d}"
+
+    commit_content += f"author {author} {timestamp} {offset_str}\n".encode()
+    commit_content += f"committer {committer} {timestamp} {offset_str}\n".encode()
+    commit_content += b"\n"
+    commit_content += message.encode()
+
+    # Hash and store the commit object
+    sha = hash_object(commit_content, "commit", repo)
+    return sha
+
+
+
+
+def cmd_add(args):
+    repo = repo_find()
+    if repo is None:
+        raise Exception("Not a myvcs repository.")
+
+    index_data = read_index(repo)
+    changed_files = []
+    new_files = []
+    unchanged_files = 0
+
+    for path in args.paths:
+        # Skip the .myvcs directory explicitly
+        if os.path.basename(path) == '.myvcs':
+            print(f"Skipping VCS directory: {path}")
+            continue
+            
+        if os.path.isfile(path):
+            # Get file content and hash
+            with open(path, "rb") as f:
+                data = f.read()
+            new_sha = hash_object(data, "blob", repo)
+            rel_path = os.path.relpath(path, start=repo.worktree)
+            
+            # Check if file exists in index
+            if rel_path in index_data:
+                # File exists - check if modified
+                if index_data[rel_path] != new_sha:
+                    index_data[rel_path] = new_sha
+                    changed_files.append(rel_path)
+                else:
+                    unchanged_files += 1
+            else:
+                # New file
+                index_data[rel_path] = new_sha
+                new_files.append(rel_path)
+                
+        elif os.path.isdir(path):
+            for root, dirs, files in os.walk(path):
+                # Remove .myvcs from directories to traverse
+                if '.myvcs' in dirs:
+                    dirs.remove('.myvcs')
+                    
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(file_path, start=repo.worktree)
+                    
+                    with open(file_path, "rb") as f:
+                        data = f.read()
+                    new_sha = hash_object(data, "blob", repo)
+                    
+                    if rel_path in index_data:
+                        if index_data[rel_path] != new_sha:
+                            index_data[rel_path] = new_sha
+                            changed_files.append(rel_path)
+                        else:
+                            unchanged_files += 1
+                    else:
+                        index_data[rel_path] = new_sha
+                        new_files.append(rel_path)
+
+    write_index(repo, index_data)
+    
+    # Print summary
+    if changed_files or new_files:
+        if new_files:
+            print(f"Added {len(new_files)} new files:")
+            for f in new_files[:5]:  # Show first 5
+                print(f"  {f}")
+            if len(new_files) > 5:
+                print(f"  ... and {len(new_files)-5} more")
+        
+        if changed_files:
+            print(f"Staged {len(changed_files)} changed files:")
+            for f in changed_files[:5]:
+                print(f"  {f}")
+            if len(changed_files) > 5:
+                print(f"  ... and {len(changed_files)-5} more")
+        
+        print(f"Total files staged: {len(changed_files)+len(new_files)}")
+        print(f"Unchanged files: {unchanged_files}")
+    else:
+        print("No changes to add.")            
+    
+# def cmd_commit(args):
+#     """Record changes to the repository."""
+#     repo = repo_find()
+#     if repo is None:
+#         raise Exception("Not a myvcs repository.")
+
+#     index_data = read_index(repo)
+#     if not index_data:
+#         print("No changes to commit.")
+#         return
+
+#     # Create tree object from index
+#     tree_sha = write_tree(repo, index_data)
+
+#     # Get parent commit SHA
+#     head_path = repo_file(repo, "HEAD")
+#     parent_sha = None
+#     head_content = None  # Initialize here to preserve it
+    
+#     if os.path.exists(head_path):
+#         with open(head_path, "r") as f:
+#             head_content = f.read().strip()  # Store in variable we'll reuse later
+#             if head_content.startswith("ref: "):
+#                 # HEAD points to a branch
+#                 branch_ref = head_content[5:]
+#                 branch_path = repo_file(repo, branch_ref)
+#                 if os.path.exists(branch_path):
+#                     with open(branch_path, "r") as bf:
+#                         parent_sha = bf.read().strip()
+#             else:
+#                 # HEAD points directly to a commit
+#                 parent_sha = head_content
+
+#     # Create commit object (unchanged)
+#     author = "Your Name <your.email@example.com>"
+#     commit_sha = commit_tree(repo, tree_sha, parent_sha, author, author, args.message)
+
+#     # Update references
+#     with open(head_path, "w") as f:
+#         if head_content and head_content.startswith("ref: "):  # Check stored head_content
+#             # Update the branch reference file
+#             branch_ref = head_content[5:]
+#             branch_path = repo_file(repo, branch_ref, mkdir=True)
+#             with open(branch_path, "w") as bf:
+#                 bf.write(commit_sha)
+#             # HEAD stays pointing to the branch (content unchanged)
+#             f.write(head_content)  # Restore original "ref: ..." content
+#         else:
+#             # Detached HEAD - update HEAD directly
+#             f.write(commit_sha)
+
+#     print(f"[{commit_sha[:7]}] {args.message}")
+
+def cmd_commit(args):
+    """Record changes to the repository."""
+    repo = repo_find()
+    if repo is None:
+        raise Exception("Not a myvcs repository.")
+
+    index_data = read_index(repo)
+    if not index_data:
+        print("No changes staged for commit.")
+        return
+
+    # Get HEAD commit SHA
+    head_path = repo_file(repo, "HEAD")
+    parent_sha = None
+    head_content = None
+    
+    if os.path.exists(head_path):
+        with open(head_path, "r") as f:
+            head_content = f.read().strip()
+            if head_content.startswith("ref: "):
+                # HEAD points to a branch
+                branch_ref = head_content[5:]
+                branch_path = repo_file(repo, branch_ref)
+                if os.path.exists(branch_path):
+                    with open(branch_path, "r") as bf:
+                        parent_sha = bf.read().strip()
+            else:
+                # HEAD points directly to a commit
+                parent_sha = head_content
+
+    # Check if there are actual changes compared to parent commit
+    if parent_sha:
+        parent_commit = read_object(repo, parent_sha)
+        if isinstance(parent_commit, Commit):
+            parent_tree_content = get_tree_content(repo, parent_commit.kvlm["tree"])
+            
+            # Compare index with parent tree
+            has_changes = False
+            all_files = set(index_data.keys()).union(set(parent_tree_content.keys()))
+            
+            for path in all_files:
+                index_sha = index_data.get(path)
+                parent_sha = parent_tree_content.get(path)
+                print(index_sha,parent_sha)
+                if index_sha != parent_sha:
+                    has_changes = True
+                    break
+            
+            if not has_changes:
+                print("No changes added to commit.")
+                return
+
+    # Create tree object from index
+    tree_sha = write_tree(repo, index_data)
+
+    # Create commit object
+    author = "Your Name <your.email@example.com>"
+    commit_sha = commit_tree(repo, tree_sha, parent_sha, author, author, args.message)
+
+    # Update references
+    with open(head_path, "w") as f:
+        if head_content and head_content.startswith("ref: "):
+            # Update the branch reference file
+            branch_ref = head_content[5:]
+            branch_path = repo_file(repo, branch_ref, mkdir=True)
+            with open(branch_path, "w") as bf:
+                bf.write(commit_sha)
+            # HEAD stays pointing to the branch (content unchanged)
+            f.write(head_content)
+        else:
+            # Detached HEAD - update HEAD directly
+            f.write(commit_sha)
+
+    print(f"[{commit_sha[:7]}] {args.message}")
+    
+def object_read(repo, sha):
+    """Read object from repository"""
+    path = os.path.join(repo.myvcsdir, "objects", sha[:2], sha[2:])
+    
+    if not os.path.exists(path):
+        raise Exception(f"Object {sha} not found")
+        
+    with open(path, "rb") as f:
+        raw = zlib.decompress(f.read())
+        
+    # Parse header
+    space = raw.find(b' ')
+    null = raw.find(b'\0', space)
+    
+    type = raw[:space].decode()
+    size = int(raw[space+1:null].decode())
+    
+    if size != len(raw) - null - 1:
+        raise Exception(f"Malformed object {sha}: bad length")
+        
+    # Create appropriate object type
+    if type == "blob":
+        return Blob(repo, raw[null+1:])
+    elif type == "tree":
+        return Tree(repo, raw[null+1:])
+    elif type == "commit":
+        return Commit(repo, raw[null+1:])
+    else:
+        raise Exception(f"Unknown object type {type} for {sha}")
+
+def object_write(obj):
+    """Write object to repository"""
+    path = os.path.join(obj.repo.myvcsdir, "objects", obj.sha[:2], obj.sha[2:])
+    
+    if os.path.exists(path):
+        return  # Object already exists
+        
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    
+    with open(path, "wb") as f:
+        # Write compressed data
+        header = f"{obj.type} {len(obj.data)}\0".encode()
+        f.write(zlib.compress(header + obj.data))
+
+
+def cmd_log(args):
+    """Show commit history in a Git-like format."""
+    repo = repo_find()
+    if repo is None:
+        raise Exception("Not a VCS repository.")
+
+    # Get HEAD reference
+    try:
+        with open(os.path.join(repo.myvcsdir, "HEAD"), "r") as f:
+            # print(f.read().strip())
+            head_content = f.read().strip()
+    except FileNotFoundError:
+        print("No commits yet.")
+        return
+
+    # Resolve HEAD to commit SHA
+    # print(f"HEAD content: {head_content}")
+    if head_content.startswith("ref: "):
+        # Branch reference
+        branch_ref = head_content[5:]
+        # print(f"Branch reference: {branch_ref}")
+        try:
+            with open(os.path.join(repo.myvcsdir, branch_ref), "r") as f:
+                current_commit_sha = f.read().strip()
+        except FileNotFoundError:
+            print(f"Error: reference {branch_ref} not found")
+            return
+    else:
+        # Detached HEAD
+        current_commit_sha = head_content
+
+    # Traverse commit history
+    seen_commits = set()  # To detect and break circular references
+    commit_count = 0
+    max_count = args.max_count if hasattr(args, 'max_count') else None
+
+    while current_commit_sha and current_commit_sha not in seen_commits:
+        if max_count is not None and commit_count >= max_count:
+            break
+            
+        seen_commits.add(current_commit_sha)
+        
+        try:
+            commit = object_read(repo, current_commit_sha)
+            if not isinstance(commit, Commit):
+                raise Exception(f"Object {current_commit_sha} is not a commit")
+                
+            # Format commit header
+            print(f"commit {current_commit_sha}")
+            
+            # Show branch/tag pointers if available
+            refs = find_refs_pointing_at(repo, current_commit_sha)
+            if refs:
+                print(" ".join(refs))
+                
+            # Author information
+            author_info = commit.kvlm.get("author", "")
+            if author_info:
+                name_email, timestamp = author_info.rsplit(" ", 2)[:2]
+                name, email = name_email.split(" <", 1) if "<" in name_email else (name_email, "")
+                email = email[:-1] if email.endswith(">") else email
+                
+                # Format timestamp
+                try:
+                    ts = int(timestamp)
+                    dt = datetime.datetime.fromtimestamp(ts, pytz.utc)
+                    date_str = dt.strftime("%a %b %d %H:%M:%S %Y %z")
+                except ValueError:
+                    date_str = timestamp
+                    
+                print(f"Author: {name} <{email}>")
+                print(f"Date:   {date_str}")
+                print()
+                
+            # Commit message
+            message = commit.kvlm.get("message", "").strip()
+            if message:
+                for line in message.splitlines():
+                    print(f"    {line}")
+                print()
+                
+            # Show diff if requested
+            if getattr(args, 'patch', False) and commit.get_parents():
+                parent_sha = commit.get_parents()[0]
+                show_commit_diff(repo, parent_sha, current_commit_sha)
+                print()
+                
+            commit_count += 1
+            current_commit_sha = commit.get_parents()[0] if commit.get_parents() else None
+            
+        except Exception as e:
+            print(f"Error reading commit {current_commit_sha}: {e}")
+            break
+
+def find_refs_pointing_at(repo, commit_sha):
+    """Find all refs (branches/tags) pointing to a commit"""
+    refs = []
+    
+    # Check branches
+    heads_dir = os.path.join(repo.myvcsdir, "refs", "heads")
+    if os.path.exists(heads_dir):
+        for branch in os.listdir(heads_dir):
+            branch_path = os.path.join(heads_dir, branch)
+            try:
+                with open(branch_path, "r") as f:
+                    if f.read().strip() == commit_sha:
+                        refs.append(f"({branch})")
+            except IOError:
+                continue
+                
+    # Check tags
+    tags_dir = os.path.join(repo.myvcsdir, "refs", "tags")
+    if os.path.exists(tags_dir):
+        for tag in os.listdir(tags_dir):
+            tag_path = os.path.join(tags_dir, tag)
+            try:
+                with open(tag_path, "r") as f:
+                    if f.read().strip() == commit_sha:
+                        refs.append(f"tag: {tag}")
+            except IOError:
+                continue
+                
+    return refs
+
+def show_commit_diff(repo, old_sha, new_sha):
+    """Show diff between two commits"""
+    old_tree = object_read(repo, old_sha).kvlm.get("tree") if old_sha else None
+    new_tree = object_read(repo, new_sha).kvlm.get("tree")
+    
+    old_files = get_tree_files(repo, old_tree) if old_tree else {}
+    new_files = get_tree_files(repo, new_tree)
+    
+    all_files = set(old_files.keys()).union(set(new_files.keys()))
+    
+    for filename in sorted(all_files):
+        old_content = old_files.get(filename, [])
+        new_content = new_files.get(filename, [])
+        
+        if old_content != new_content:
+            print(f"diff --vcs a/{filename} b/{filename}")
+            print(f"index {old_files.get(filename, '0000000')[:7]}..{new_files.get(filename, '0000000')[:7]}")
+            
+            diff = difflib.unified_diff(
+                old_content,
+                new_content,
+                fromfile=f"a/{filename}",
+                tofile=f"b/{filename}",
+                lineterm=""
+            )
+            for line in diff:
+                print(line)
+
+def get_tree_files(repo, tree_sha):
+    """Get all files in a tree recursively"""
+    files = {}
+    tree = object_read(repo, tree_sha)
+    
+    for entry in tree.entries:
+        if entry.type == "blob":
+            blob = object_read(repo, entry.sha)
+            files[entry.name] = blob.data.decode().splitlines()
+        elif entry.type == "tree":
+            subtree_files = get_tree_files(repo, entry.sha)
+            for name, content in subtree_files.items():
+                files[f"{entry.name}/{name}"] = content
+                
+    return files
+
+
+# def get_tree_content(repo, tree_sha, path=""):
+#     """Recursively get the content of files in a tree object."""
+#     content = {}
+#     tree = read_object(repo, tree_sha)
+#     if not isinstance(tree, Tree):
+#         raise Exception(f"Object {tree_sha} is not a tree.")
+
+#     for entry in tree.entries:
+#         entry_path = os.path.join(path, entry["name"])
+#         if entry["type"] == "blob":
+#             blob = read_object(repo, entry["sha"])
+#             if isinstance(blob, Blob):
+#                 content[entry_path] = blob.data.decode().splitlines()
+#             else:
+#                  print(f"Warning: Object {entry['sha']} is not a blob.")
+#         elif entry["type"] == "tree":
+#             content.update(get_tree_content(repo, entry["sha"], path=entry_path))
+#     return content
+
+def get_tree_content(repo, tree_sha, base_path=""):
+    """Recursively get the content of files in a tree object."""
+    content = {}
+    tree = read_object(repo, tree_sha)
+    if not isinstance(tree, Tree):
+        raise Exception(f"Object {tree_sha} is not a tree.")
+
+    for entry in tree.entries:
+        entry_path = os.path.join(base_path, entry["name"])
+        if entry["type"] == "blob":
+            blob = read_object(repo, entry["sha"])
+            if isinstance(blob, Blob):
+                content[entry_path] = blob.data.decode().splitlines()
+        elif entry["type"] == "tree":
+            content.update(get_tree_content(repo, entry["sha"], entry_path))
+    return content
+
+def read_object(repo, sha):
+    """Read object with given SHA-1 hash from object store and deserialize it."""
+    type, data = cat_file(repo, sha)
+
+    if type == "blob":
+        return Blob(repo, data)
+    elif type == "tree":
+        return Tree(repo, data)
+    elif type == "commit":
+        return Commit(repo, data)
+    else:
+        raise Exception(f"Unknown object type {type} for object {sha}")
+
+
+def hash_object(data, type, repo):
+    """Compute hash of object data of given type and add to object store."""
+    header = type.encode() + b' ' + str(len(data)).encode() + b'\0'
+    store = header + data
+    sha = hashlib.sha1(store).hexdigest()
+
+    with open(repo_file(repo, "objects", sha[0:2], sha[2:], mkdir=True), "wb") as f:
+        f.write(zlib.compress(store))
+
+    return sha
+
+def write_tree(repo, index_data, path=""):
+    """Write a tree object from the index data."""
+    entries = []
+    
+    # Group entries by directory
+    dirs = {}
+    files = {}
+    
+    for file_path, sha in index_data.items():
+        # Normalize path separators
+        file_path = file_path.replace(os.sep, '/')
+        
+        # Split into directory components
+        parts = file_path.split('/')
+        if len(parts) == 1:
+            # File in current directory
+            files[parts[0]] = sha
+        else:
+            # File in subdirectory
+            dir_name = parts[0]
+            if dir_name not in dirs:
+                dirs[dir_name] = {}
+            remaining_path = '/'.join(parts[1:])
+            dirs[dir_name][remaining_path] = sha
+    
+    # Process files in current directory
+    for name, sha in sorted(files.items()):
+        mode = stat.S_IFREG | 0o644  # Regular file mode
+        entries.append(f"{mode:o} blob {sha}\t{name}\n".encode())
+    
+    # Process subdirectories
+    for dir_name, subdir_data in sorted(dirs.items()):
+        subdir_sha = write_tree(repo, subdir_data, os.path.join(path, dir_name))
+        mode = stat.S_IFDIR | 0o755  # Directory mode
+        entries.append(f"{mode:o} tree {subdir_sha}\t{dir_name}\n".encode())
+    
+    tree_content = b''.join(entries)
+    return hash_object(tree_content, "tree", repo)
+
+def cat_file(repo, sha):
+    """Read object with given SHA-1 hash from object store."""
+    obj_path = repo_file(repo, "objects", sha[0:2], sha[2:])
+
+    if not os.path.exists(obj_path):
+        return None, None # Object not found
+
+    with open(obj_path, "rb") as f:
+        store = zlib.decompress(f.read())
+
+    # Read object type
+    space = store.find(b' ')
+    type = store[0:space].decode()
+
+    # Read object size
+    null = store.find(b'\0', space)
+    size = int(store[space+1:null].decode())
+
+    # Read object data
+    data = store[null+1:]
+
+    if size != len(data):
+        raise Exception(f"Malformed object {sha}: expected size {size}, got {len(data)}")
+
+    return type, data
+
+
+def read_index(repo):
+    """Read the index file and return its content."""
+    index_path = repo_file(repo, "index")
+    if not os.path.exists(index_path):
+        return {}
+
+    with open(index_path, "r") as f:
+        index_data = json.load(f)
+    return index_data
+
+def write_index(repo, index_data):
+    """Write the index data to the index file."""
+    index_path = repo_file(repo, "index", mkdir=True)
+    with open(index_path, "w") as f:
+        json.dump(index_data, f, indent=4)
+
+
+# Helper function to create directories if they don't exist
+def repo_dir(repo, *path, mkdir=False):
+    """Same as repo_path, but mkdir *path if absent."""
+    path = repo_path(repo, *path)
+
+    if os.path.exists(path):
+        if os.path.isdir(path):
+            return path
+        else:
+            raise Exception(f"Not a directory {path}")
+
+    if mkdir:
+        os.makedirs(path)
+        return path
+    else:
+        return None
+
+# Helper function to get the path to a file and create parent directories if needed
+def repo_file(repo, *path, mkdir=False):
+    """Same as repo_path, but mkdir dirname(*path) if absent."""
+    if repo_dir(repo, *path[:-1], mkdir=mkdir):
+        return repo_path(repo, *path)
+    return None
+
+# Class to represent the repository
+class GitRepository(object):
+    """A myvcs repository"""
+    def __init__(self, path, force=False):
+        self.worktree = path
+        self.myvcsdir = os.path.join(path, ".myvcs")
+
+        if not (force or os.path.isdir(self.myvcsdir)):
+            raise Exception(f"Not a myvcs repository {path}")
+
+        # Read configuration file in .myvcs/config
+        self.config = configparser.ConfigParser()
+        cf = repo_file(self, "config")
+
+        if cf and os.path.exists(cf):
+            self.config.read([cf])
+        elif not force:
+            raise Exception("Configuration file missing")
+
+        if not force:
+            vers = int(self.config.get("core", "repositoryformatversion"))
+            if vers != 0:
+                raise Exception(f"Unsupported repositoryformatversion {vers}")
+
+# Function to find the repository root
+
+
+# Implementation of the init command
+def cmd_init(args):
+    """Initializes a new, empty repository."""
+    repo = GitRepository(args.path, force=True)
+
+    if os.path.exists(repo.worktree):
+        if not os.path.isdir(repo.worktree):
+            raise Exception(f"{args.path} is not a directory!")
+        if os.listdir(repo.worktree):
+            if not args.empty:
+                raise Exception(f"{args.path} is not empty!")
+    else:
+        os.makedirs(repo.worktree)
+
+    repo_dir(repo, "objects", mkdir=True)
+    repo_dir(repo, "refs", "heads", mkdir=True)
+
+    # .myvcs/description
+    with open(repo_file(repo, "description"), "w") as f:
+        f.write("Unnamed repository; edit this file 'description' to name the repository.\n")
+
+    # .myvcs/config
+    config = default_config()
+    with open(repo_file(repo, "config"), "w") as f:
+        config.write(f)
+
+    # .myvcs/HEAD
+    with open(repo_file(repo, "HEAD"), "w") as f:
+        f.write("ref: refs/heads/main\n")
+
+    print(f"Initialized empty myvcs repository in {repo.myvcsdir}")
+
+def default_config():
+    """Returns a ConfigParser object with default myvcs configuration."""
+    config = configparser.ConfigParser()
+    config.add_section("core")
+    config.set("core", "repositoryformatversion", "0")
+    config.set("core", "filemode", "false")
+    config.set("core", "bare", "false")
+    return config
+
+
+def is_vcs_path(path, repo):
+    """Check if path is inside the VCS directory"""
+    print(f"Checking if {path} is a VCS path in {repo.myvcsdir}")
+    abs_path = os.path.abspath(path)
+    abs_vcs = os.path.abspath(repo.myvcsdir)
+    print(f"Absolute path: {abs_path}")
+    print(f"Absolute VCS path: {abs_vcs}")
+    print(abs_path.startswith(abs_vcs + os.sep))
+    return abs_path.startswith(abs_vcs + os.sep)
+
+
+def cmd_diff(args):
+    """Show changes between commits."""
+    repo = repo_find()
+    if repo is None:
+        raise Exception("Not a myvcs repository.")
+
+    if len(args.commits) != 2:
+        raise Exception("Please provide exactly two commit SHAs to diff.")
+
+    commit1_sha, commit2_sha = args.commits
+    commit1 = read_object(repo, commit1_sha)
+    commit2 = read_object(repo, commit2_sha)
+    
+    if not isinstance(commit1, Commit) or not isinstance(commit2, Commit):
+        raise Exception("Both provided SHAs must be commits.")
+
+    tree1_content = get_tree_content(repo, commit1.kvlm["tree"])
+    tree2_content = get_tree_content(repo, commit2.kvlm["tree"])
+    
+    all_files = set(tree1_content.keys()).union(set(tree2_content.keys()))
+    
+    for path in sorted(all_files):
+        content1 = tree1_content.get(path, [])
+        content2 = tree2_content.get(path, [])
+        
+        if content1 != content2:
+            # Print unified diff header only once
+            print(f"diff --vcs a/{path} b/{path}")
+            
+            # Handle new/deleted files
+            if path not in tree1_content:
+                print(f"new file mode 100644")
+                print(f"--- /dev/null")
+                print(f"+++ b/{path}")
+            elif path not in tree2_content:
+                print(f"deleted file mode 100644")
+                print(f"--- a/{path}")
+                print(f"+++ /dev/null")
+            else:
+                print(f"--- a/{path}")
+                print(f"+++ b/{path}")
+            
+            # Generate and print the actual diff
+            differ = difflib.unified_diff(
+                content1,
+                content2,
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}",
+                lineterm='',
+                n=3  # Number of context lines
+            )
+            
+            # Skip the first two lines (headers we already printed)
+            diff_lines = list(differ)[2:]
+            for line in diff_lines:
+                print(line)
+# def cmd_status(args):
+#     """Show the working tree status."""
+#     repo = repo_find()
+#     if repo is None:
+#         raise Exception("Not a myvcs repository.")
+
+#     # Get HEAD commit
+#     head_path = repo_file(repo, "HEAD")
+#     head_commit_sha = None
+#     current_branch = None
+    
+#     if os.path.exists(head_path):
+#         with open(head_path, "r") as f:
+#             head_content = f.read().strip()
+#             if head_content.startswith("ref: "):
+#                 # Branch reference
+#                 current_branch = head_content[5:].split("/")[-1]
+#                 branch_path = repo_file(repo, head_content[5:])
+#                 if os.path.exists(branch_path):
+#                     with open(branch_path, "r") as bf:
+#                         head_commit_sha = bf.read().strip()
+#             else:
+#                 # Detached HEAD
+#                 head_commit_sha = head_content
+
+#     # Get index (staging area)
+#     index_data = read_index(repo)
+    
+#     # Get HEAD tree content if available
+#     head_tree_content = {}
+#     if head_commit_sha:
+#         commit = read_object(repo, head_commit_sha)
+#         if isinstance(commit, Commit):
+#             head_tree_content = get_tree_content(repo, commit.kvlm["tree"])
+
+#     # Scan working directory
+#     working_files = {}
+#     for root, dirs, files in os.walk(repo.worktree):
+#         # Skip .myvcs directory
+#         if '.myvcs' in dirs:
+#             dirs.remove('.myvcs')
+            
+#         for file in files:
+#             file_path = os.path.join(root, file)
+#             rel_path = os.path.relpath(file_path, start=repo.worktree)
+            
+#             with open(file_path, "rb") as f:
+#                 data = f.read()
+#             working_files[rel_path] = hashlib.sha1(data).hexdigest()
+
+#     # Analyze status
+#     staged = {}        # Files in index but different from HEAD
+#     unstaged = {}      # Files in working tree but different from index
+#     untracked = []     # Files not in index
+#     deleted = []       # Files in HEAD/index but missing in working tree
+    
+#     # Check files in HEAD
+#     for path in head_tree_content:
+#         if path not in index_data and path not in working_files:
+#             deleted.append(path)
+    
+#     # Check files in index
+#     for path, index_sha in index_data.items():
+#         head_sha = head_tree_content.get(path)
+#         working_sha = working_files.get(path)
+        
+#         # Staged changes (different from HEAD)
+#         if head_sha != index_sha:
+#             staged[path] = (head_sha, index_sha)
+        
+#         # Unstaged changes (different from working tree)
+#         if working_sha and working_sha != index_sha:
+#             unstaged[path] = (index_sha, working_sha)
+            
+#         # Deleted files (in index but missing in working tree)
+#         if path not in working_files:
+#             deleted.append(path)
+    
+#     # Check untracked files (in working tree but not in index)
+#     for path in working_files:
+#         if path not in index_data and path not in head_tree_content:
+#             untracked.append(path)
+    
+#     # Print status
+#     if current_branch:
+#         print(f"On branch {current_branch}")
+#     else:
+#         print(f"HEAD detached at {head_commit_sha[:7]}")
+#     print()
+    
+#     # Staged changes
+#     if staged:
+#         print("Changes to be committed:")
+#         print('  (use "myvcs restore --staged <file>..." to unstage)')
+#         print()
+#         for path in sorted(staged.keys()):
+#             print(f"        modified:   {path}")
+#         print()
+    
+#     # Unstaged changes
+#     if unstaged:
+#         print("Changes not staged for commit:")
+#         print('  (use "myvcs add <file>..." to update what will be committed)')
+#         print('  (use "myvcs restore <file>..." to discard changes in working directory)')
+#         print()
+#         for path in sorted(unstaged.keys()):
+#             print(f"        modified:   {path}")
+#         print()
+    
+#     # Untracked files
+#     if untracked:
+#         print("Untracked files:")
+#         print('  (use "myvcs add <file>..." to include in what will be committed)')
+#         print()
+#         for path in sorted(untracked):
+#             print(f"        {path}")
+#         print()
+    
+#     # Deleted files
+#     if deleted:
+#         print("Deleted files:")
+#         print('  (use "myvcs add/rm <file>..." to update what will be committed)')
+#         print()
+#         for path in sorted(deleted):
+#             print(f"        deleted:    {path}")
+#         print()
+    
+#     if not (staged or unstaged or untracked or deleted):
+#         print("nothing to commit, working tree clean")
+
+
+def cmd_status(args):
+    """Show the working tree status."""
+    repo = repo_find()
+    if repo is None:
+        raise Exception("Not a myvcs repository.")
+
+    # Get HEAD commit
+    head_path = repo_file(repo, "HEAD")
+    head_commit_sha = None
+    current_branch = None
+    
+    if os.path.exists(head_path):
+        with open(head_path, "r") as f:
+            head_content = f.read().strip()
+            if head_content.startswith("ref: "):
+                # Branch reference
+                current_branch = head_content[5:].split("/")[-1]
+                branch_path = repo_file(repo, head_content[5:])
+                if os.path.exists(branch_path):
+                    with open(branch_path, "r") as bf:
+                        head_commit_sha = bf.read().strip()
+            else:
+                # Detached HEAD
+                head_commit_sha = head_content
+
+    # Get index (staging area)
+    index_data = read_index(repo)
+    
+    # Get HEAD tree content if available
+    head_tree_content = {}
+    if head_commit_sha:
+        commit = read_object(repo, head_commit_sha)
+        if isinstance(commit, Commit):
+            head_tree_content = get_tree_content(repo, commit.kvlm["tree"])
+
+    # Scan working directory
+    working_files = {}
+    for root, dirs, files in os.walk(repo.worktree):
+        # Skip .myvcs directory
+        if '.myvcs' in dirs:
+            dirs.remove('.myvcs')
+            
+        for file in files:
+            file_path = os.path.join(root, file)
+            rel_path = os.path.relpath(file_path, start=repo.worktree)
+            
+            with open(file_path, "rb") as f:
+                data = f.read()
+            working_sha = hash_object(data, "blob", repo)
+            working_files[rel_path] = working_sha
+
+    # Analyze status
+    staged = {}        # Files in index but different from HEAD
+    unstaged = {}      # Files in working tree but different from index
+    untracked = []     # Files not in index
+    deleted = []       # Files in HEAD/index but missing in working tree
+    
+    # Check files in HEAD
+    for path in head_tree_content:
+        if path not in index_data and path not in working_files:
+            deleted.append(path)
+    
+    # Check files in index
+    for path, index_sha in index_data.items():
+        head_sha = head_tree_content.get(path)
+        working_sha = working_files.get(path)
+        
+        # Staged changes (different from HEAD)
+        if head_sha != index_sha:
+            staged[path] = (head_sha, index_sha)
+        
+        # Unstaged changes (different from working tree)
+        if path in working_files and working_sha != index_sha:
+            unstaged[path] = (index_sha, working_sha)
+            
+        # Deleted files (in index but missing in working tree)
+        if path not in working_files:
+            deleted.append(path)
+    
+    # Check untracked files (in working tree but not in index)
+    for path in working_files:
+        if path not in index_data and path not in head_tree_content:
+            untracked.append(path)
+    
+    # Print status
+    if current_branch:
+        print(f"On branch {current_branch}")
+    else:
+        print(f"HEAD detached at {head_commit_sha[:7]}")
+    print()
+    
+    # Staged changes
+    if staged:
+        print("Changes to be committed:")
+        print('  (use "myvcs restore --staged <file>..." to unstage)')
+        print()
+        for path in sorted(staged.keys()):
+            print(f"        modified:   {path}")
+        print()
+    
+    # Unstaged changes
+    if unstaged:
+        print("Changes not staged for commit:")
+        print('  (use "myvcs add <file>..." to update what will be committed)')
+        print('  (use "myvcs restore <file>..." to discard changes in working directory)')
+        print()
+        for path in sorted(unstaged.keys()):
+            print(f"        modified:   {path}")
+        print()
+    
+    # Untracked files
+    if untracked:
+        print("Untracked files:")
+        print('  (use "myvcs add <file>..." to include in what will be committed)')
+        print()
+        for path in sorted(untracked):
+            print(f"        {path}")
+        print()
+    
+    # Deleted files
+    if deleted:
+        print("Deleted files:")
+        print('  (use "myvcs add/rm <file>..." to update what will be committed)')
+        print()
+        for path in sorted(deleted):
+            print(f"        deleted:    {path}")
+        print()
+    
+    if not (staged or unstaged or untracked or deleted):
+        print("nothing to commit, working tree clean")
+
+def main():
+    parser = argparse.ArgumentParser(description="A minimal Git-like VCS from scratch")
+
+    subparsers = parser.add_subparsers(title="commands", dest="command")
+    subparsers.required = True
+
+    # init command parser
+    init_parser = subparsers.add_parser("init", help="Initialize a new, empty repository.")
+    init_parser.add_argument("path", metavar="directory", nargs="?", default=".", help="Where to create the repository.")
+    init_parser.add_argument("--empty", "-e", action="store_true", help="Allow initializing in a non-empty directory.")
+    init_parser.set_defaults(func=cmd_init)
+
+    # add command parser
+    add_parser = subparsers.add_parser("add", help="Add file contents to the staging area.")
+    add_parser.add_argument("paths", metavar="path", nargs="+", help="Paths of files to add.")
+    add_parser.set_defaults(func=cmd_add)
+
+    # commit command parser
+    commit_parser = subparsers.add_parser("commit", help="Record changes to the repository.")
+    commit_parser.add_argument("-m", "--message", required=True, help="Commit message.")
+    commit_parser.set_defaults(func=cmd_commit)
+
+    # log command parser
+    log_parser = subparsers.add_parser("log", help="Show commit history.")
+    log_parser.set_defaults(func=cmd_log)
+
+    # diff command parser
+    diff_parser = subparsers.add_parser("diff", help="Show changes between commits.")
+    diff_parser.add_argument("commits", metavar="commit", nargs=2, help="Commit SHAs to diff.")
+    diff_parser.set_defaults(func=cmd_diff)
+
+    # checkout command parser
+    checkout_parser = subparsers.add_parser("checkout", help="Restore files from a commit or switch branches.")
+    checkout_parser.add_argument("target", metavar="target", help="Commit SHA or branch name to checkout.")
+    checkout_parser.set_defaults(func=cmd_checkout)
+
+    # branch command parser
+    branch_parser = subparsers.add_parser("branch", help="Create a new branch reference.")
+    branch_parser.add_argument("name", metavar="branch-name", help="Name of the new branch.")
+    branch_parser.add_argument("start_point", metavar="start-point", nargs="?", help="Commit SHA to start the branch from (defaults to HEAD).")
+    branch_parser.set_defaults(func=cmd_branch)
+
+    # tag command parser
+    tag_parser = subparsers.add_parser("tag", help="Create a new tag reference.")
+    tag_parser.add_argument("name", metavar="tag-name", help="Name of the new tag.")
+    tag_parser.add_argument("commit", metavar="commit", nargs="?", default=None, help="Commit SHA to tag (defaults to HEAD).") # Default to None for now, will handle HEAD in cmd_tag
+    tag_parser.set_defaults(func=cmd_tag)
+    
+    status_parser = subparsers.add_parser("status", help="Show the working tree status.")
+    status_parser.set_defaults(func=cmd_status)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    main()
